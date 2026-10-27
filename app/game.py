@@ -32,6 +32,9 @@ MESSAGE_COLOR = (255, 210, 90)     # 提示信息颜色
 BUTTON_BG = (56, 62, 76)           # 按钮背景色
 BUTTON_HOVER = (74, 82, 100)       # 按钮悬停色
 BUTTON_BORDER = (110, 120, 140)    # 按钮边框色
+SCROLLBAR_TRACK_COLOR = (45, 49, 58)      # 滚动条轨道颜色
+SCROLLBAR_THUMB_COLOR = (110, 120, 140)   # 滚动条滑块颜色
+SCROLLBAR_WIDTH = 8                        # 滚动条宽度（像素）
 
 # 键盘按键到移动方向的映射（方向键 + WASD）
 KEY_TO_DIRECTION = {
@@ -72,14 +75,14 @@ class Button:
         self.font = font
         self.action = action
 
-    def draw(self, surface: pygame.Surface, mouse_pos: Tuple[int, int]) -> None:
-        """绘制按钮，并根据鼠标位置显示悬停效果。"""
-        hovered = self.rect.collidepoint(mouse_pos)
+    def draw(self, surface: pygame.Surface, screen_rect: pygame.Rect, mouse_pos: Tuple[int, int]) -> None:
+        """在指定屏幕矩形上绘制按钮，并根据鼠标位置显示悬停效果。"""
+        hovered = screen_rect.collidepoint(mouse_pos)
         bg = BUTTON_HOVER if hovered else BUTTON_BG
-        pygame.draw.rect(surface, bg, self.rect, border_radius=6)
-        pygame.draw.rect(surface, BUTTON_BORDER, self.rect, width=1, border_radius=6)
+        pygame.draw.rect(surface, bg, screen_rect, border_radius=6)
+        pygame.draw.rect(surface, BUTTON_BORDER, screen_rect, width=1, border_radius=6)
         label = self.font.render(self.text, True, TEXT_COLOR)
-        surface.blit(label, label.get_rect(center=self.rect.center))
+        surface.blit(label, label.get_rect(center=screen_rect.center))
 
     def is_clicked(self, pos: Tuple[int, int]) -> bool:
         """判断鼠标点击位置是否落在按钮上。"""
@@ -120,6 +123,13 @@ class MazeGame:
         self.font_small = _load_font(16)
         self.font_normal = _load_font(20)
         self.font_title = _load_font(24)
+
+        # 侧边栏滚动状态
+        self.panel_scroll = 0.0          # 当前滚动偏移（像素）
+        self.panel_content_height = 0    # 侧边栏内容总高度
+        self._panel_message_y = 0        # 提示信息起始 y 坐标（内容坐标）
+        self._dragging_scrollbar = False # 是否正在拖动滚动条
+        self._scrollbar_drag_last_y = 0  # 拖动滚动条时的上一个鼠标 y 坐标
 
         # 初始化一局新游戏
         self.reset()
@@ -240,11 +250,63 @@ class MazeGame:
             self.message = "已清除路径"
 
     def handle_click(self, pos: Tuple[int, int]) -> None:
-        """处理鼠标点击事件，触发被点击按钮的动作。"""
+        """处理鼠标左键点击：优先处理滚动条，其次触发按钮动作。"""
+        panel = self._panel_rect()
+        self._layout_panel()
+        self._clamp_scroll()
+
+        # 若内容溢出，先判断是否点击了滚动条（滑块或轨道）
+        if self._max_scroll() > 0:
+            track, thumb = self._scrollbar_metrics(panel)
+            if thumb.collidepoint(pos) or track.collidepoint(pos):
+                self._dragging_scrollbar = True
+                self._scrollbar_drag_last_y = pos[1]
+                if track.collidepoint(pos) and not thumb.collidepoint(pos):
+                    # 点击轨道空白处：让滑块跳转到点击位置
+                    self._scroll_to_thumb_center(pos[1])
+                return
+
+        # 将屏幕坐标转换为内容坐标（补偿滚动偏移）后再命中按钮
+        content_pos = (pos[0], pos[1] + int(self.panel_scroll))
         for button in self._build_buttons():
-            if button.is_clicked(pos):
+            if button.is_clicked(content_pos):
                 button.action()
                 break
+
+    def handle_wheel(self, event) -> None:
+        """处理鼠标滚轮事件：仅当鼠标悬停在侧边栏内时滚动内容。"""
+        if self._panel_rect().collidepoint(pygame.mouse.get_pos()):
+            # 向上滚动（event.y > 0）时内容上移，即滚动偏移减小
+            self.panel_scroll -= event.y * 40
+            self._clamp_scroll()
+
+    def handle_drag_scroll(self, pos: Tuple[int, int]) -> None:
+        """处理滚动条拖动：根据鼠标纵向位移同步更新滚动位置。"""
+        if not self._dragging_scrollbar:
+            return
+        track, thumb = self._scrollbar_metrics(self._panel_rect())
+        max_scroll = self._max_scroll()
+        if max_scroll <= 0:
+            return
+
+        dy = pos[1] - self._scrollbar_drag_last_y
+        self._scrollbar_drag_last_y = pos[1]
+        # 像素位移与滚动位移成正比（滑块可移动范围对应滚动范围）
+        scroll_per_px = max_scroll / (track.height - thumb.height)
+        self.panel_scroll += dy * scroll_per_px
+        self._clamp_scroll()
+
+    def _scroll_to_thumb_center(self, y: int) -> None:
+        """将滑块中心移动到指定纵向坐标，并同步更新滚动位置。"""
+        track, thumb = self._scrollbar_metrics(self._panel_rect())
+        max_scroll = self._max_scroll()
+        if max_scroll <= 0:
+            self.panel_scroll = 0.0
+            return
+        target_top = y - thumb.height / 2
+        ratio = (target_top - track.top) / (track.height - thumb.height)
+        ratio = max(0.0, min(1.0, ratio))
+        self.panel_scroll = ratio * max_scroll
 
     # ------------------------------------------------------------------
     # 渲染
@@ -308,19 +370,102 @@ class MazeGame:
                 if cell.has_wall(EAST):
                     pygame.draw.line(self.surface, WALL_COLOR, (x + self.cell_size, y), (x + self.cell_size, y + self.cell_size), 2)
 
-    def _draw_panel(self) -> None:
-        """绘制右侧侧边栏：标题、统计信息、提示与操作按钮。"""
-        panel_rect = pygame.Rect(
+    def _panel_rect(self) -> pygame.Rect:
+        """返回侧边栏面板在屏幕上的矩形区域。"""
+        return pygame.Rect(
             self.margin + self.maze_size[0],
             self.margin,
             self.panel_width - self.margin,
             self.maze_size[1],
         )
-        pygame.draw.rect(self.surface, PANEL_COLOR, panel_rect, border_radius=8)
 
-        px = panel_rect.x + 16
-        py = panel_rect.y + 16
+    def _layout_panel(self) -> None:
+        """布局侧边栏内容：设置各按钮的内容坐标并计算内容总高度。"""
+        panel = self._panel_rect()
+        x = panel.x + 16
+        y = panel.y + 16
+        inner_w = panel.width - 32
         line_gap = 28
+
+        # 标题占位高度
+        y += 40
+        # 基础信息（2 行）
+        y += line_gap * 2
+        y += 8
+        # 寻路统计信息（最多 5 行）
+        if self.stats is not None:
+            y += line_gap * 5
+            y += 8
+
+        # 操作按钮（按钮 rect 保存内容坐标，绘制时再减去滚动偏移）
+        button_h = 34
+        button_gap = 10
+        for button in self._build_buttons():
+            button.rect.update(x, y, inner_w, button_h)
+            y += button_h + button_gap
+
+        # 底部提示信息
+        y += 6
+        self._panel_message_y = y
+        y += 22 * len(self._wrap_text(self.message, inner_w))
+
+        self.panel_content_height = y - panel.y
+
+    def _max_scroll(self) -> float:
+        """返回可滚动的最大偏移量（内容超出面板的部分）。"""
+        return max(0.0, self.panel_content_height - self._panel_rect().height)
+
+    def _clamp_scroll(self) -> None:
+        """将滚动偏移限制在合法范围内。"""
+        self.panel_scroll = max(0.0, min(self.panel_scroll, self._max_scroll()))
+
+    def _scrollbar_metrics(self, panel: pygame.Rect) -> Tuple[pygame.Rect, pygame.Rect]:
+        """根据当前滚动状态计算滚动条的轨道与滑块矩形。"""
+        track = pygame.Rect(
+            panel.right - SCROLLBAR_WIDTH - 4,
+            panel.top + 4,
+            SCROLLBAR_WIDTH,
+            panel.height - 8,
+        )
+        view = panel.height
+        # 滑块高度与可视比例成正比，但保留最小可抓取高度
+        thumb_h = max(20, int(view * view / self.panel_content_height))
+        max_scroll = self._max_scroll()
+        thumb_y = track.top
+        if max_scroll > 0:
+            thumb_y = track.top + int(
+                (self.panel_scroll / max_scroll) * (track.height - thumb_h)
+            )
+        thumb = pygame.Rect(track.x, thumb_y, SCROLLBAR_WIDTH, thumb_h)
+        return track, thumb
+
+    def _draw_panel(self) -> None:
+        """绘制右侧侧边栏：标题、统计信息、提示、操作按钮与滚动条。"""
+        panel = self._panel_rect()
+        pygame.draw.rect(self.surface, PANEL_COLOR, panel, border_radius=8)
+
+        self._layout_panel()
+        self._clamp_scroll()
+        offset = int(self.panel_scroll)
+
+        # 在面板区域内裁剪，防止内容溢出到面板之外
+        self.surface.set_clip(panel)
+        try:
+            self._draw_panel_content(offset)
+        finally:
+            self.surface.set_clip(None)
+
+        # 内容超出可视区域时绘制滚动条
+        if self._max_scroll() > 0:
+            self._draw_scrollbar(panel)
+
+    def _draw_panel_content(self, offset: int) -> None:
+        """在侧边栏内绘制可滚动的内容（标题、信息、按钮与提示）。"""
+        panel = self._panel_rect()
+        px = panel.x + 16
+        py = panel.y + 16 - offset
+        line_gap = 28
+        mouse_pos = pygame.mouse.get_pos()
 
         # 标题
         title = self.font_title.render("迷宫寻路", True, TEXT_COLOR)
@@ -352,20 +497,22 @@ class MazeGame:
                 py += line_gap
             py += 8
 
-        # 操作按钮
-        button_w = panel_rect.width - 32
-        button_h = 34
-        button_gap = 10
+        # 操作按钮（按钮 rect 存内容坐标，绘制时减去滚动偏移）
         for button in self._build_buttons():
-            button.rect.update(px, py, button_w, button_h)
-            button.draw(self.surface, pygame.mouse.get_pos())
-            py += button_h + button_gap
+            screen_rect = button.rect.move(0, -offset)
+            button.draw(self.surface, screen_rect, mouse_pos)
 
         # 底部提示信息（自动换行）
-        py += 6
-        for line in self._wrap_text(self.message, panel_rect.width - 32):
+        py = self._panel_message_y - offset
+        for line in self._wrap_text(self.message, panel.width - 32):
             self.surface.blit(self.font_small.render(line, True, MESSAGE_COLOR), (px, py))
             py += 22
+
+    def _draw_scrollbar(self, panel: pygame.Rect) -> None:
+        """绘制滚动条轨道与滑块。"""
+        track, thumb = self._scrollbar_metrics(panel)
+        pygame.draw.rect(self.surface, SCROLLBAR_TRACK_COLOR, track, border_radius=SCROLLBAR_WIDTH // 2)
+        pygame.draw.rect(self.surface, SCROLLBAR_THUMB_COLOR, thumb, border_radius=SCROLLBAR_WIDTH // 2)
 
     def _build_buttons(self) -> List[Button]:
         """构建操作按钮列表（每次调用会复用同一批按钮对象）。"""
@@ -421,8 +568,14 @@ class MazeGame:
                     running = False
                 elif event.type == pygame.KEYDOWN:
                     self.handle_key(event.key)
+                elif event.type == pygame.MOUSEWHEEL:
+                    self.handle_wheel(event)
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     self.handle_click(event.pos)
+                elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                    self._dragging_scrollbar = False
+                elif event.type == pygame.MOUSEMOTION:
+                    self.handle_drag_scroll(event.pos)
 
             # 推进寻路路径动画
             self.update_animation(dt)
