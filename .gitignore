@@ -16,3 +16,6 @@ htmlcov/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 环境变量与密钥（切勿提交）
+.env

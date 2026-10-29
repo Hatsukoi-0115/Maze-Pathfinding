@@ -7,12 +7,14 @@
 from __future__ import annotations
 
 import sys
+import threading
 from typing import Callable, List, Optional, Tuple
 
 import pygame
 
 from maze import DIRECTIONS, EAST, NORTH, SOUTH, WEST, Maze, Player, find_path, generate_dfs
 from maze.pathfinding import PathResult
+from app.llm_client import LLMResult, build_compare_messages, build_explain_messages, chat
 
 # ---------------------------------------------------------------------------
 # 颜色常量
@@ -131,8 +133,21 @@ class MazeGame:
         self._dragging_scrollbar = False # 是否正在拖动滚动条
         self._scrollbar_drag_last_y = 0  # 拖动滚动条时的上一个鼠标 y 坐标
 
+        # AI 扩展状态
+        self.ai_result: Optional[str] = None    # 当前显示在侧边栏的 AI 文本
+        self.ai_loading = False                  # 对比分析是否正在请求大模型
+        self._ai_thread: Optional[threading.Thread] = None  # 后台请求线程
+
+        # 算法解释缓存（不依赖当前迷宫，程序启动时预加载一次）
+        self._explain_text: Optional[str] = None   # 缓存的解释文本（加载成功）
+        self._explain_error: Optional[str] = None  # 解释加载失败的错误信息
+        self._explain_loading = False              # 解释是否正在后台加载
+
         # 初始化一局新游戏
         self.reset()
+
+        # 启动时后台预加载一次算法解释，后续点击按钮直接显示
+        self._start_explain_preload()
 
     # ------------------------------------------------------------------
     # 状态管理
@@ -149,6 +164,10 @@ class MazeGame:
         self.stats: Optional[PathResult] = None
         self.message = "使用方向键/WASD 移动，点击按钮自动寻路"
         self.stop_animation()
+
+        # 新迷宫对应新的分析结果，清空旧的 AI 输出
+        self.ai_result = None
+        self.ai_loading = False
 
     def stop_animation(self) -> None:
         """停止寻路路径动画。"""
@@ -230,6 +249,101 @@ class MazeGame:
                 self.player.teleport(self.anim_path[-1])
             else:
                 self.player.teleport(self.anim_path[self.anim_index])
+
+    # ------------------------------------------------------------------
+    # AI 扩展
+    # ------------------------------------------------------------------
+    def _start_explain_preload(self) -> None:
+        """后台预加载一次算法解释并缓存，供后续点击按钮直接显示。"""
+        if self._explain_loading or self._explain_text is not None:
+            return
+        self._explain_loading = True
+        self._explain_error = None
+        self._ai_thread = threading.Thread(target=self._explain_preload_worker, daemon=True)
+        self._ai_thread.start()
+
+    def _explain_preload_worker(self) -> None:
+        """后台线程：调用大模型解释算法，并把结果写入缓存。"""
+        result = chat(build_explain_messages())
+        self._explain_loading = False
+        if result.ok:
+            self._explain_text = result.text
+            self._explain_error = None
+        else:
+            self._explain_text = None
+            self._explain_error = result.error
+
+    def request_ai_explain(self) -> None:
+        """显示 AI 算法解释（结果已在启动时预加载缓存，不再调用 API）。"""
+        if self._explain_text is not None:
+            # 已有缓存：直接显示
+            self.ai_result = self._explain_text
+            self.message = "AI 算法解释（启动时已预加载）"
+        elif self._explain_loading:
+            # 仍在后台加载中
+            self.ai_result = None
+            self.message = "AI 解释正在加载，请稍候…"
+        else:
+            # 启动时加载失败或未触发：重试一次
+            self.ai_result = None
+            self.message = "AI 解释加载失败，正在重试…"
+            self._start_explain_preload()
+
+    def request_ai_compare(self) -> None:
+        """请求大模型对比分析当前迷宫上 BFS 与 A* 的运行结果。"""
+        if self.ai_loading:
+            return
+        self.ai_loading = True
+        self.ai_result = None
+        self.message = "AI 正在对比分析 BFS 与 A*，请稍候…"
+
+        # 捕获当前状态快照，避免主线程重置迷宫时产生竞态
+        maze = self.maze
+        start = self.start
+        goal = self.goal
+        rows, cols = self.rows, self.cols
+        self._ai_thread = threading.Thread(
+            target=self._ai_compare_worker,
+            args=(maze, start, goal, rows, cols),
+            daemon=True,
+        )
+        self._ai_thread.start()
+
+    def _ai_compare_worker(
+        self,
+        maze: Maze,
+        start: Tuple[int, int],
+        goal: Tuple[int, int],
+        rows: int,
+        cols: int,
+    ) -> None:
+        """后台线程：运行两种算法并调用大模型做对比分析。"""
+        bfs_result = find_path(maze, start, goal, "bfs")
+        astar_result = find_path(maze, start, goal, "astar")
+        messages = build_compare_messages(
+            rows,
+            cols,
+            bfs_result.found,
+            bfs_result.length,
+            bfs_result.visited_count,
+            bfs_result.elapsed_ms,
+            astar_result.found,
+            astar_result.length,
+            astar_result.visited_count,
+            astar_result.elapsed_ms,
+        )
+        result = chat(messages)
+        self._finish_ai(result)
+
+    def _finish_ai(self, result: LLMResult) -> None:
+        """在后台线程中回写 AI 调用结果（简单属性赋值，线程安全）。"""
+        self.ai_loading = False
+        if result.ok:
+            self.ai_result = result.text
+            self.message = "AI 已完成，滚动侧边栏查看结果"
+        else:
+            self.ai_result = None
+            self.message = f"AI 调用失败：{result.error}"
 
     # ------------------------------------------------------------------
     # 事件处理
@@ -409,6 +523,10 @@ class MazeGame:
         self._panel_message_y = y
         y += 22 * len(self._wrap_text(self.message, inner_w))
 
+        # AI 结果（长文本，逐字符换行）
+        if self.ai_result:
+            y += 22 * len(self._wrap_text(self.ai_result, inner_w))
+
         self.panel_content_height = y - panel.y
 
     def _max_scroll(self) -> float:
@@ -508,6 +626,12 @@ class MazeGame:
             self.surface.blit(self.font_small.render(line, True, MESSAGE_COLOR), (px, py))
             py += 22
 
+        # AI 结果（长文本，自动换行显示）
+        if self.ai_result:
+            for line in self._wrap_text(self.ai_result, panel.width - 32):
+                self.surface.blit(self.font_small.render(line, True, TEXT_COLOR), (px, py))
+                py += 22
+
     def _draw_scrollbar(self, panel: pygame.Rect) -> None:
         """绘制滚动条轨道与滑块。"""
         track, thumb = self._scrollbar_metrics(panel)
@@ -526,6 +650,8 @@ class MazeGame:
                 Button(pygame.Rect(0, 0, 0, 0), "A* 自动寻路", self.font_normal, lambda: self.run_pathfinding("astar")),
                 Button(pygame.Rect(0, 0, 0, 0), "重新生成", self.font_normal, self.reset),
                 Button(pygame.Rect(0, 0, 0, 0), "清除路径", self.font_normal, self._clear_path_action),
+                Button(pygame.Rect(0, 0, 0, 0), "AI 解释算法", self.font_normal, self.request_ai_explain),
+                Button(pygame.Rect(0, 0, 0, 0), "AI 对比分析", self.font_normal, self.request_ai_compare),
             ]
         return self._buttons
 
@@ -536,18 +662,25 @@ class MazeGame:
         self.message = "已清除路径"
 
     def _wrap_text(self, text: str, max_width: int) -> List[str]:
-        """将长文本按像素宽度自动换行。"""
-        words = text.split(" ")
+        """将文本按像素宽度逐字符换行（兼容中文与换行符）。
+
+        逐字符累加并测量渲染宽度，超出最大宽度时换行；
+        遇到显式换行符则直接换行。适合 AI 返回的中文长文本。
+        """
         lines: List[str] = []
         current = ""
-        for word in words:
-            candidate = word if not current else current + " " + word
+        for ch in text:
+            if ch == "\n":
+                lines.append(current)
+                current = ""
+                continue
+            candidate = current + ch
             if self.font_small.size(candidate)[0] <= max_width:
                 current = candidate
             else:
                 if current:
                     lines.append(current)
-                current = word
+                current = ch
         if current:
             lines.append(current)
         return lines

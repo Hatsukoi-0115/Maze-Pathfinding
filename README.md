@@ -11,6 +11,7 @@
 - **自动寻路**：内置 BFS 与 A* 两种算法，可一键寻路并动画展示路径。
 - **路径可视化**：高亮显示寻路路径与已访问节点，支持重新生成与清除路径。
 - **统计展示**：显示路径长度、访问节点数、寻路耗时与是否可达。
+- **AI 扩展**：调用大模型解释 BFS/A* 算法，并对比分析两种算法在当前迷宫上的运行结果。
 
 ## 目录结构
 
@@ -18,8 +19,10 @@
 Maze Pathfinding/
 ├── main.py                  # 程序入口
 ├── pyproject.toml           # 项目与依赖配置（uv 管理）
+├── .env                     # 大模型 API 配置（本地文件，不提交）
 ├── app/
-│   └── game.py              # pygame 图形界面与交互
+│   ├── game.py              # pygame 图形界面与交互
+│   └── llm_client.py        # 大模型客户端（读取 .env 并调用 API）
 ├── maze/                    # 核心逻辑（纯 Python，可独立测试）
 │   ├── maze.py              # 迷宫数据模型与墙体/边界判断
 │   ├── generator.py         # 递归回溯 DFS 迷宫生成
@@ -36,6 +39,18 @@ Maze Pathfinding/
 # 同步并安装依赖
 uv sync
 ```
+
+### 配置大模型（AI 扩展）
+
+在项目根目录创建 `.env` 文件，配置大模型 API（OpenAI 兼容接口）：
+
+```dotenv
+LLM_BASE_URL=https://api.deepseek.com/v1
+LLM_API_KEY=你的密钥
+LLM_MODEL=deepseek-chat
+```
+
+未配置 `.env` 时，AI 扩展功能会在界面提示配置缺失，其余功能不受影响。
 
 ## 运行程序
 
@@ -59,6 +74,8 @@ uv run python main.py --rows 15 --cols 15 --cell 30
 | A* 自动寻路 | 按键 `2` 或点击按钮 |
 | 重新生成迷宫 | 按键 `R` 或点击按钮 |
 | 清除路径 | 按键 `C` 或点击按钮 |
+| AI 解释算法 | 点击「AI 解释算法」按钮 |
+| AI 对比分析 | 点击「AI 对比分析」按钮 |
 
 ## 运行测试
 
@@ -66,4 +83,4 @@ uv run python main.py --rows 15 --cols 15 --cell 30
 uv run pytest
 ```
 
-测试覆盖：迷宫生成连通性、边界墙完整性、寻路路径合法性、BFS/A* 最短路径一致性、玩家撞墙/越界判断、无法寻路场景等。
+测试覆盖：迷宫生成连通性、边界墙完整性、寻路路径合法性、BFS/A* 最短路径一致性、玩家撞墙/越界判断、无法寻路场景、大模型配置读取与调用（mock，不实际请求 API）等。
